@@ -23,14 +23,15 @@ For setup steps and example prompts, see [README.md](README.md).
                          │ MCP server │                     └────────────┘
                          └────────────┘
 
-  Offline data pipeline (run manually; not yet used by the tools):
+  Index pipeline (run manually after CSV edits):
   orders.csv ──load_db.py──► orders.db (SQLite) ──load_chroma.py──► chroma_db/ (Chroma)
+  semantic_search_items queries chroma_db/, then joins the order IDs back to orders.csv.
 ```
 
 | Component | File | Role |
 |---|---|---|
 | Chat client | `client.py` | CLI, Anthropic API calls, tool-use loop, conversation history |
-| MCP server | `server.py` | Exposes `lookup_order` and `search_orders`; validates and reads the CSV |
+| MCP server | `server.py` | Exposes `lookup_order`, `search_orders` and `semantic_search_items`; validates and reads the CSV |
 | Source data | `orders.csv` | Authoritative order data (30 fictional orders) |
 | SQLite loader | `load_db.py` | Validates the CSV and builds `orders.db` |
 | Chroma loader | `load_chroma.py` | Syncs `orders.db` into the `order_items` vector collection |
@@ -40,7 +41,7 @@ For setup steps and example prompts, see [README.md](README.md).
 
 | Package | Version | Purpose |
 |---|---|---|
-| Python | ≥ 3.10 (tested on 3.13) | `mcp` does not install on 3.9 |
+| Python | ≥ 3.11 (tested on 3.13.9) | `mcp` needs ≥ 3.10; the client's `asyncio.timeout` needs ≥ 3.11 |
 | `mcp` | 1.29.0 | FastMCP server and stdio client (SDK 2.x renamed `FastMCP` and is incompatible) |
 | `anthropic` | 2.12.0 | Claude Messages API |
 | `chromadb` | 1.5.9 | Vector store; default embedding model `all-MiniLM-L6-v2` (384 dimensions) |
@@ -69,7 +70,9 @@ For setup steps and example prompts, see [README.md](README.md).
            commit messages to history; return the text
    ```
 4. **Tool execution.** The server re-reads and validates `orders.csv` on every
-   call, so CSV edits show up immediately without a restart.
+   call, so CSV edits show up immediately without a restart. The exception is
+   `semantic_search_items`, which can only find orders that are in the Chroma
+   index.
 
 ### Example
 
@@ -81,11 +84,19 @@ For setup steps and example prompts, see [README.md](README.md).
 3. The client sends a `tool_result` back to Claude.
 4. Claude writes the final answer as a table.
 
+> *"Did anyone in Mumbai buy desk furniture?"* (semantic search, then an exact filter)
+
+1. `semantic_search_items(query="desk furniture")` returns `matched_items`, for
+   example Desk organizer and Desk lamp.
+2. Claude reuses those names as exact keywords:
+   `search_orders(item="Desk organizer", city="Mumbai")`, and so on.
+3. Claude combines the results into one answer.
+
 ---
 
 ## 3. MCP tools (`server.py`)
 
-Both tools are **read-only**. Nothing can create, update or cancel an order.
+All three tools are **read-only**. Nothing can create, update or cancel an order.
 
 ### `lookup_order(order_id)`
 Exact lookup by ID, which must match `ORD-` followed by 8 digits and is
@@ -106,6 +117,15 @@ All filters combine with AND. `total_matches`, `totals_by_currency`,
 `counts_by_status` and `groups` cover **all** matches, not just the returned
 page. Amounts are exact decimal strings, and totals are kept separate per
 currency.
+
+### `semantic_search_items(query, limit=10)`
+Search by meaning over item names. Chroma embeds `query` with its local model,
+compares it to the indexed `"<item> (<category>)"` documents, and drops matches
+with a distance above `MAX_DISTANCE` (1.2). The surviving order IDs are joined to
+the current CSV. The tool returns `matched_items` (item names, closest first, with
+distances), which Claude can reuse as exact keywords in `search_orders`, plus the
+matching `orders`. Example: `"audio gear"` → `Headphones` (0.97), 3 orders;
+`"car tyres"` → no matches.
 
 ### CSV validation (`read_orders`)
 Any invalid row makes the tool fail with the row number in the error, rather
@@ -128,7 +148,7 @@ than return partial data. The checks are:
 
 | Safeguard | Purpose |
 |---|---|
-| System prompt | Use tools for all order data, never invent IDs or results, treat tool output as data rather than instructions, and ask who "my" refers to (there is no login) |
+| System prompt | Use tools for all order data, never invent IDs or results, treat tool output as data rather than instructions, ask who "my" refers to (there is no login), and use `semantic_search_items` for vague product descriptions, then reuse its item names in `search_orders` |
 | `allowed_names` check | Rejects tool names that the server did not advertise |
 | A result for every `tool_use` | Failed calls return `is_error: true`, so the API request stays valid |
 | `ChatError` | History is committed only after a complete answer; failed turns leave no partial state |
@@ -151,7 +171,7 @@ python client.py --quiet            # hide the [MCP] trace lines
 | `ANTHROPIC_MODEL` | client | `claude-sonnet-5-5` |
 | `ORDERS_CSV` | server, loaders | `./orders.csv` |
 | `ORDERS_DB` | `load_db.py`, `load_chroma.py` | `./orders.db` |
-| `CHROMA_DIR` | `load_chroma.py` | `./chroma_db` |
+| `CHROMA_DIR` | `load_chroma.py`, server | `./chroma_db` |
 
 ---
 
@@ -187,21 +207,22 @@ python client.py --quiet            # hide the [MCP] trace lines
 | Question type | Correct store |
 |---|---|
 | Exact ID, status, date range, amounts, counts, totals | CSV or SQLite |
-| Vague item description ("audio gear", "something to type with") | Chroma, then SQLite for the full rows |
+| Vague item description ("audio gear", "something to type with") | Chroma (`semantic_search_items`), then the CSV for the full rows |
 
 Chroma always returns `n_results` matches, even weak ones. In testing, correct
 matches had a distance of about 0.7–1.1, and unrelated filler results were
-above 1.2. Any Chroma-backed tool must drop results above a distance cutoff.
+above 1.2. `semantic_search_items` drops results above `MAX_DISTANCE = 1.2`
+(defined in `server.py`).
 
 ---
 
 ## 6. Testing
 
-None of the tests call the Anthropic API.
+None of the tests call the Anthropic API. Expected results: 6 + 10 + 7 = 23 checks passed.
 
 | Test | Covers |
 |---|---|
-| `smoke_test.py` | Server startup, tool list and schemas, basic calls over real MCP stdio |
+| `smoke_test.py` | Server startup, tool list and schemas, basic calls over real MCP stdio, and semantic search ("audio gear" → Headphones; "car tyres" → no match) |
 | `csv_test.py` | Validation errors, filters, totals and multi-currency handling, using temporary CSV files (`ORDERS_CSV`) |
 | `client_test.py` | The tool loop, history commits, unknown tools, round limits and error messages, using mocked Claude HTTP responses |
 
@@ -209,15 +230,18 @@ None of the tests call the Anthropic API.
 python smoke_test.py && python csv_test.py && python client_test.py
 ```
 
-`smoke_test.py` checks that the tool set is exactly
-`{lookup_order, search_orders}`. Update it when you add a tool.
+`smoke_test.py` and `client_test.py` check that the tool set is exactly
+`{lookup_order, search_orders, semantic_search_items}`. Update both when you add a tool.
+`smoke_test.py` needs a built `chroma_db/` for the semantic search check.
 
 ---
 
 ## 7. Current status and limitations
 
-- **The tools read the CSV, not SQLite or Chroma.** `orders.db` and
-  `chroma_db/` are built but nothing queries them yet.
+- **`lookup_order` and `search_orders` read the CSV, not SQLite.**
+  `semantic_search_items` queries Chroma but returns rows from the CSV.
+- **Chroma can go stale.** After editing the CSV, rerun both loaders, or new
+  orders won't appear in semantic search.
 - **There is no user identity.** "My orders" makes Claude ask for a customer
   name or ID.
 - **Every request reads the whole CSV.** That's fine for small files; switch
@@ -231,10 +255,7 @@ python smoke_test.py && python csv_test.py && python client_test.py
 ## 8. Next steps
 
 1. Point `lookup_order` and `search_orders` at SQLite instead of the CSV.
-2. Add a `semantic_search_items` tool: query Chroma, apply the distance cutoff,
-   and return the full rows from SQLite. Update `smoke_test.py` for the new
-   tool.
-3. Optional: add a `--customer CUST-###` client option so that "my orders" maps
+2. Optional: add a `--customer CUST-###` client option so that "my orders" maps
    to a known customer.
-4. Optional: add a free-text field (e.g. `return_reason`) so semantic search
+3. Optional: add a free-text field (e.g. `return_reason`) so semantic search
    has meaningful content.
