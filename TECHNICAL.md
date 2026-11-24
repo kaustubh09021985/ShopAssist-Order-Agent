@@ -18,15 +18,40 @@ For setup steps and example prompts, see [README.md](README.md).
 └──────────┘   answer    └─────┬──────┘  tool_use / final text  └──────────────┘
                                │ MCP over stdio (JSON-RPC)
                                ▼
-                         ┌────────────┐   read + validate   ┌────────────┐
-                         │ server.py  │────────────────────►│ orders.csv │
-                         │ MCP server │                     └────────────┘
-                         └────────────┘
-
-  Index pipeline (run manually after CSV edits):
-  orders.csv ──load_db.py──► orders.db (SQLite) ──load_chroma.py──► chroma_db/ (Chroma)
-  semantic_search_items queries chroma_db/, then joins the order IDs back to orders.csv.
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ server.py (MCP server)                                                       │
+│                                                                              │
+│  lookup_order ─────────┐                    semantic_search_items            │
+│  search_orders ────────┤                     │                  │            │
+│                        │ read + validate     │ ② join IDs       │ ① query    │
+│                        ▼                     ▼                  ▼            │
+└────────────────────────┼─────────────────────┼──────────────────┼────────────┘
+                         ▼                     │                  ▼
+                  ┌──────────────┐             │       ┌────────────────────────┐
+                  │  orders.csv  │◄────────────┘       │ chroma_db/  (Chroma)   │
+                  │ source of    │                     │ collection order_items │
+                  │ truth        │                     │ id = order_id          │
+                  └──────┬───────┘                     │ doc = "item (category)"│
+                         │                             │ embedding: 384 numbers │
+   Index pipeline        │ python load_db.py           │ metadata: status, city,│
+   (run manually         ▼                             │   customer_id, date    │
+   after CSV edits)  ┌──────────────────────┐          └────────────────────────┘
+                     │ orders.db  (SQLite)  │                     ▲
+                     │ table orders         │  python load_chroma.py
+                     │ money in paise       │─────────────────────┘
+                     └──────────────────────┘    (upsert + delete stale IDs;
+                                                  embeddings from local
+                                                  all-MiniLM-L6-v2 model)
 ```
+
+| Path | Steps |
+|---|---|
+| **Exact questions** | `lookup_order` / `search_orders` → read and validate `orders.csv` |
+| **Vague item questions** | `semantic_search_items` → ① Chroma embeds the query and returns the nearest order IDs with distances, dropping any above 1.2 → ② the tool joins those IDs to `orders.csv` for full, current rows |
+| **Index build** (offline) | `orders.csv` → `load_db.py` → `orders.db` → `load_chroma.py` → `chroma_db/` |
+
+SQLite is currently a staging store between the CSV and Chroma. No tool queries
+it directly yet (see [Next steps](#8-next-steps)).
 
 | Component | File | Role |
 |---|---|---|
@@ -192,7 +217,7 @@ python client.py --quiet            # hide the [MCP] trace lines
 ### Chroma: `chroma_db/`, collection `order_items` (built by `load_chroma.py`)
 | Field | Content |
 |---|---|
-| `id` | `order_id`, used to fetch the full row from SQLite |
+| `id` | `order_id`, used by `semantic_search_items` to fetch the full row from `orders.csv` |
 | `document` | `"<item> (<category>)"`, e.g. `"Keyboard (Electronics)"` (the text that gets embedded) |
 | `metadata` | `status`, `city`, `customer_id`, `order_date` (for exact `where` filters) |
 
